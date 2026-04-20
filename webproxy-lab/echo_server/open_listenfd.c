@@ -12,9 +12,12 @@ int open_listenfd(const char *port)
     memset(&hints, 0, sizeof(hints));
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_flags = AI_PASSIVE | AI_NUMERICSERV;
-#ifdef AI_ADDRCONFIG
+
+    #ifdef AI_ADDRCONFIG
+
     hints.ai_flags |= AI_ADDRCONFIG;
-#endif
+
+    #endif
 
     if (getaddrinfo(NULL, port, &hints, &listp) != 0) {
         return -1;

@@ -1,22 +1,19 @@
-/* $begin tinymain */
 /*
- * tiny.c - A simple, iterative HTTP/1.0 Web server that uses the
- *     GET method to serve static and dynamic content.
- *
- * Updated 11/2019 droh
- *   - Fixed sprintf() aliasing issue in serve_static(), and clienterror().
+ * tiny.c - A small iterative HTTP/1.0 web server.
  */
 #include "csapp.h"
+#include <strings.h>
 
 void doit(int fd);
 void read_requesthdrs(rio_t *rp);
 int parse_uri(char *uri, char *filename, char *cgiargs);
-void serve_static(int fd, char *filename, int filesize);
+void serve_static(int fd, char *filename, int filesize, int head_only);
 void get_filetype(char *filename, char *filetype);
-void serve_dynamic(int fd, char *filename, char *cgiargs);
+void serve_dynamic(int fd, char *filename, char *cgiargs, int head_only);
 void clienterror(int fd, char *cause, char *errnum, char *shortmsg,
-                 char *longmsg);
+                 char *longmsg, int head_only);
 
+// 지정한 포트에서 클라이언트 연결을 계속 받고, 연결마다 doit()으로 HTTP 요청을 처리한다.
 int main(int argc, char **argv)
 {
   int listenfd, connfd;
@@ -24,7 +21,6 @@ int main(int argc, char **argv)
   socklen_t clientlen;
   struct sockaddr_storage clientaddr;
 
-  /* Check command line args */
   if (argc != 2)
   {
     fprintf(stderr, "usage: %s <port>\n", argv[0]);
@@ -32,176 +28,196 @@ int main(int argc, char **argv)
   }
 
   listenfd = Open_listenfd(argv[1]);
+  printf("[debug] tiny server start, port=%s\n", argv[1]);
+
   while (1)
   {
     clientlen = sizeof(clientaddr);
-    connfd = Accept(listenfd, (SA *)&clientaddr,
-                    &clientlen); // line:netp:tiny:accept
+    connfd = Accept(listenfd, (SA *)&clientaddr, &clientlen);
     Getnameinfo((SA *)&clientaddr, clientlen, hostname, MAXLINE, port, MAXLINE,
                 0);
     printf("Accepted connection from (%s, %s)\n", hostname, port);
-    doit(connfd);  // line:netp:tiny:doit
-    Close(connfd); // line:netp:tiny:close
+    printf("[debug] client connected: %s:%s\n", hostname, port);
+    doit(connfd);
+    Close(connfd);
   }
 }
 
-/*
- * doit - handle one HTTP request/response transaction
- */
+// HTTP 요청 하나를 읽고, 메소드와 URI에 따라 정적 파일 응답 또는 CGI 응답을 선택해서 보낸다.
 void doit(int fd)
 {
-  int is_static;
+  int is_static, head_only;
   struct stat sbuf;
   char buf[MAXLINE], method[MAXLINE], uri[MAXLINE], version[MAXLINE];
   char filename[MAXLINE], cgiargs[MAXLINE];
   rio_t rio;
 
-  /* Read request line and headers */
   Rio_readinitb(&rio, fd);
-  if (!Rio_readlineb(&rio, buf, MAXLINE))
+  if (Rio_readlineb(&rio, buf, MAXLINE) <= 0)
     return;
+
   printf("%s", buf);
-  sscanf(buf, "%s %s %s", method, uri, version);
-  if (strcasecmp(method, "GET"))
+  printf("[debug] request line: %s", buf);
+
+  if (sscanf(buf, "%s %s %s", method, uri, version) != 3)
   {
-    clienterror(fd, method, "501", "Not Implemented",
-                "Tiny does not implement this method");
+    clienterror(fd, buf, "400", "Bad Request",
+                "Tiny could not parse the request line", 0);
     return;
   }
+
+  printf("[debug] method=%s, uri=%s, version=%s\n", method, uri, version);
+
+  head_only = !strcasecmp(method, "HEAD");
+  if (strcasecmp(method, "GET") && strcasecmp(method, "HEAD"))
+  {
+    clienterror(fd, method, "501", "Not Implemented",
+                "Tiny only implements GET and HEAD", 0);
+    return;
+  }
+
   read_requesthdrs(&rio);
 
-  /* Parse URI from GET request */
   is_static = parse_uri(uri, filename, cgiargs);
+  printf("[debug] file=%s, cgiargs=%s, static=%d, head=%d\n",
+         filename, cgiargs, is_static, head_only);
+
   if (stat(filename, &sbuf) < 0)
   {
-    clienterror(fd, filename, "404", "Not found",
-                "Tiny couldn't find this file");
+    clienterror(fd, filename, "404", "Not Found",
+                "Tiny could not find this file", head_only);
     return;
   }
 
   if (is_static)
-  { /* Serve static content */
-    if (!(S_ISREG(sbuf.st_mode)) || !(S_IRUSR & sbuf.st_mode))
+  {
+    if (!S_ISREG(sbuf.st_mode) || !(S_IRUSR & sbuf.st_mode))
     {
       clienterror(fd, filename, "403", "Forbidden",
-                  "Tiny couldn't read the file");
+                  "Tiny could not read this file", head_only);
       return;
     }
-    serve_static(fd, filename, sbuf.st_size);
+
+    serve_static(fd, filename, sbuf.st_size, head_only);
   }
   else
-  { /* Serve dynamic content */
-    if (!(S_ISREG(sbuf.st_mode)) || !(S_IXUSR & sbuf.st_mode))
+  {
+    if (!S_ISREG(sbuf.st_mode) || !(S_IXUSR & sbuf.st_mode))
     {
       clienterror(fd, filename, "403", "Forbidden",
-                  "Tiny couldn't run the CGI program");
+                  "Tiny could not run this CGI program", head_only);
       return;
     }
-    serve_dynamic(fd, filename, cgiargs);
+
+    serve_dynamic(fd, filename, cgiargs, head_only);
   }
 }
 
-/*
- * read_requesthdrs - read HTTP request headers
- */
+// 요청 헤더를 빈 줄까지 읽고 버린다. 출력은 디버깅용 로그뿐이고, 응답 body는 만들지 않는다.
 void read_requesthdrs(rio_t *rp)
 {
   char buf[MAXLINE];
+  int header_count = 0;
 
-  Rio_readlineb(rp, buf, MAXLINE);
-  printf("%s", buf);
-  while (strcmp(buf, "\r\n"))
+  while (Rio_readlineb(rp, buf, MAXLINE) > 0)
   {
-    Rio_readlineb(rp, buf, MAXLINE);
     printf("%s", buf);
+    if (!strcmp(buf, "\r\n"))
+      break;
+    header_count++;
   }
-  return;
+
+  printf("[debug] header count=%d\n", header_count);
 }
 
-/*
- * parse_uri - parse URI into filename and CGI args
- *             return 0 if dynamic content, 1 if static
- */
+// URI를 실제 파일 경로로 바꾸고, 정적 요청이면 1, CGI 요청이면 0을 반환한다.
 int parse_uri(char *uri, char *filename, char *cgiargs)
 {
   char *ptr;
 
   if (!strstr(uri, "cgi-bin"))
-  { /* Static content */
+  {
     strcpy(cgiargs, "");
     strcpy(filename, ".");
     strcat(filename, uri);
     if (uri[strlen(uri) - 1] == '/')
       strcat(filename, "home.html");
+    printf("[debug] static uri maps to %s\n", filename);
     return 1;
   }
+
+  ptr = strchr(uri, '?');
+  if (ptr)
+  {
+    strcpy(cgiargs, ptr + 1);
+    *ptr = '\0';
+  }
   else
-  { /* Dynamic content */
-    ptr = index(uri, '?');
-    if (ptr)
+  {
+    strcpy(cgiargs, "");
+  }
+
+  strcpy(filename, ".");
+  strcat(filename, uri);
+  printf("[debug] dynamic uri maps to %s, args=%s\n", filename, cgiargs);
+  return 0;
+}
+
+// 정적 파일의 HTTP 200 응답을 만든다. GET이면 malloc으로 파일을 읽어 body를 보내고, HEAD면 헤더만 보낸다.
+void serve_static(int fd, char *filename, int filesize, int head_only)
+{
+  int srcfd;
+  char *srcp = NULL;
+  char filetype[64], buf[MAXBUF];
+
+  if (!head_only && filesize > 0)
+  {
+    srcp = malloc(filesize);
+    if (srcp == NULL)
     {
-      strcpy(cgiargs, ptr + 1);
-      *ptr = '\0';
+      clienterror(fd, filename, "500", "Internal Server Error",
+                  "Tiny could not allocate memory for this file", 0);
+      return;
     }
-    else
-      strcpy(cgiargs, "");
-    strcpy(filename, ".");
-    strcat(filename, uri);
-    return 0;
+
+    srcfd = Open(filename, O_RDONLY, 0);
+    if (rio_readn(srcfd, srcp, filesize) != filesize)
+    {
+      Close(srcfd);
+      free(srcp);
+      clienterror(fd, filename, "500", "Internal Server Error",
+                  "Tiny could not read this file", 0);
+      return;
+    }
+    Close(srcfd);
+  }
+
+  get_filetype(filename, filetype);
+  printf("[debug] static response: %s, %d bytes, %s\n",
+         filename, filesize, filetype);
+
+  snprintf(buf, sizeof(buf),
+           "HTTP/1.0 200 OK\r\n"
+           "Server: Tiny Web Server\r\n"
+           "Connection: close\r\n"
+           "Content-length: %d\r\n"
+           "Content-type: %s\r\n\r\n",
+           filesize, filetype);
+
+  rio_writen(fd, buf, strlen(buf));
+  printf("Response headers:\n%s", buf);
+
+  if (head_only)
+    return;
+
+  if (filesize > 0)
+  {
+    rio_writen(fd, srcp, filesize);
+    free(srcp);
   }
 }
 
-/*
- * serve_static - copy a file back to the client
- */
-void serve_static(int fd, char *filename, int filesize)
-{
-  int srcfd;
-  char *srcp, filetype[MAXLINE];
-
-  char buf[MAXBUF];
-  char *p = buf;
-  int n;
-  int remaining = sizeof(buf);
-
-  /* Send response headers to client */
-  get_filetype(filename, filetype);
-
-  n = snprintf(p, remaining, "HTTP/1.0 200 OK\r\n");
-  p += n;
-  remaining -= n;
-
-  n = snprintf(p, remaining, "Server: Tiny Web Server\r\n");
-  p += n;
-  remaining -= n;
-
-  n = snprintf(p, remaining, "Connection: close\r\n");
-  p += n;
-  remaining -= n;
-
-  n = snprintf(p, remaining, "Content-length: %d\r\n", filesize);
-  p += n;
-  remaining -= n;
-
-  n = snprintf(p, remaining, "Content-type: %s\r\n\r\n", filetype);
-  p += n;
-  remaining -= n;
-
-  Rio_writen(fd, buf, strlen(buf));
-  printf("Response headers:\n");
-  printf("%s", buf);
-
-  /* Send response body to client */
-  srcfd = Open(filename, O_RDONLY, 0);
-  srcp = Mmap(0, filesize, PROT_READ, MAP_PRIVATE, srcfd, 0);
-  Close(srcfd);
-  Rio_writen(fd, srcp, filesize);
-  Munmap(srcp, filesize);
-}
-
-/*
- * get_filetype - derive file type from file name
- */
+// 파일 확장자를 보고 HTTP 응답의 Content-type 값을 정한다.
 void get_filetype(char *filename, char *filetype)
 {
   if (strstr(filename, ".html"))
@@ -210,85 +226,73 @@ void get_filetype(char *filename, char *filetype)
     strcpy(filetype, "image/gif");
   else if (strstr(filename, ".png"))
     strcpy(filetype, "image/png");
-  else if (strstr(filename, ".jpg"))
+  else if (strstr(filename, ".jpg") || strstr(filename, ".jpeg"))
     strcpy(filetype, "image/jpeg");
+  else if (strstr(filename, ".css"))
+    strcpy(filetype, "text/css");
+  else if (strstr(filename, ".js"))
+    strcpy(filetype, "application/javascript");
+  else if (strstr(filename, ".mpg") || strstr(filename, ".mpeg"))
+    strcpy(filetype, "video/mpeg");
   else
     strcpy(filetype, "text/plain");
 }
 
-/*
- * serve_dynamic - run a CGI program on behalf of the client
- */
-void serve_dynamic(int fd, char *filename, char *cgiargs)
+// CGI 프로그램을 실행해서 동적 HTTP 200 응답을 만든다. CGI의 stdout이 클라이언트 응답 body가 된다.
+void serve_dynamic(int fd, char *filename, char *cgiargs, int head_only)
 {
   char buf[MAXLINE], *emptylist[] = {NULL};
-  pid_t pid;
 
-  /* Return first part of HTTP response */
-  sprintf(buf, "HTTP/1.0 200 OK\r\n");
-  Rio_writen(fd, buf, strlen(buf));
-  sprintf(buf, "Server: Tiny Web Server\r\n");
+  printf("[debug] cgi response: program=%s, query=%s\n", filename, cgiargs);
+
+  snprintf(buf, sizeof(buf),
+           "HTTP/1.0 200 OK\r\n"
+           "Server: Tiny Web Server\r\n"
+           "Connection: close\r\n");
   Rio_writen(fd, buf, strlen(buf));
 
-  /* Create a child process to handle the CGI program */
-  if ((pid = Fork()) < 0)
+  if (head_only)
   {
-    perror("Fork failed");
+    char *head_end = "Content-type: text/html\r\n\r\n";
+    Rio_writen(fd, head_end, strlen(head_end));
     return;
   }
 
-  if (pid == 0)
+  if (Fork() == 0)
   {
+    printf("[debug] child process runs CGI now\n");
     setenv("QUERY_STRING", cgiargs, 1);
-
-    if (Dup2(fd, STDOUT_FILENO) < 0)
-    {
-      perror("Dup2 error");
-      exit(1);
-    }
+    Dup2(fd, STDOUT_FILENO);
     Close(fd);
-
     Execve(filename, emptylist, environ);
-
-    perror("Execve error");
-    exit(1);
   }
-  else
-  {
-    int status;
-    if (waitpid(pid, &status, 0) < 0)
-    {
-      perror("Wait error");
-    }
 
-    printf("Child process %d terminated with status %d\n", pid, status);
-  }
+  Wait(NULL);
 }
 
-/*
- * clienterror - returns an error message to the client
- */
+// 에러 상태 코드와 HTML 에러 페이지를 응답으로 보낸다. HEAD 요청이면 body는 보내지 않는다.
 void clienterror(int fd, char *cause, char *errnum,
-                 char *shortmsg, char *longmsg)
+                 char *shortmsg, char *longmsg, int head_only)
 {
   char buf[MAXLINE], body[MAXBUF];
 
-  /* Build the HTTP response body */
-  sprintf(body, "<html><title>Tiny Error</title>");
-  sprintf(body, "%s<body bgcolor="
-                "ffffff"
-                ">\r\n",
-          body);
-  sprintf(body, "%s%s: %s\r\n", body, errnum, shortmsg);
-  sprintf(body, "%s<p>%s: %s\r\n", body, longmsg, cause);
-  sprintf(body, "%s<hr><em>The Tiny Web server</em>\r\n", body);
+  printf("[debug] error response: %s %s, cause=%s\n", errnum, shortmsg, cause);
 
-  /* Print the HTTP response */
-  sprintf(buf, "HTTP/1.0 %s %s\r\n", errnum, shortmsg);
+  snprintf(body, sizeof(body),
+           "<html><title>Tiny Error</title>"
+           "<body bgcolor=\"ffffff\">\r\n"
+           "%s: %s\r\n"
+           "<p>%s: %s\r\n"
+           "<hr><em>The Tiny Web server</em>\r\n",
+           errnum, shortmsg, longmsg, cause);
+
+  snprintf(buf, sizeof(buf), "HTTP/1.0 %s %s\r\n", errnum, shortmsg);
   Rio_writen(fd, buf, strlen(buf));
-  sprintf(buf, "Content-type: text/html\r\n");
+  snprintf(buf, sizeof(buf), "Content-type: text/html\r\n");
   Rio_writen(fd, buf, strlen(buf));
-  sprintf(buf, "Content-length: %d\r\n\r\n", (int)strlen(body));
+  snprintf(buf, sizeof(buf), "Content-length: %d\r\n\r\n", (int)strlen(body));
   Rio_writen(fd, buf, strlen(buf));
-  Rio_writen(fd, body, strlen(body));
+
+  if (!head_only)
+    Rio_writen(fd, body, strlen(body));
 }

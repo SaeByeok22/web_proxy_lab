@@ -1,35 +1,48 @@
 /*
- * adder.c - a minimal CGI program that adds two numbers together
+ * adder.c - a tiny CGI program that adds two numbers.
  */
-/* $begin adder */
 #include "csapp.h"
+
+static int value_from_arg(char *arg)
+{
+  char *eq = strchr(arg, '=');
+
+  if (eq)
+    return atoi(eq + 1);
+  return atoi(arg);
+}
 
 int main(void)
 {
-  char *buf, *p;
+  char *query;
+  char query_copy[MAXLINE];
   char arg1[MAXLINE], arg2[MAXLINE], content[MAXLINE];
+  char *amp;
   int n1 = 0, n2 = 0;
 
-  /* Extract the two arguments */
-  if ((buf = getenv("QUERY_STRING")) != NULL)
+  query = getenv("QUERY_STRING");
+  if (query == NULL)
+    query = "";
+
+  snprintf(query_copy, sizeof(query_copy), "%s", query);
+  amp = strchr(query_copy, '&');
+  if (amp)
   {
-    p = strchr(buf, '&');
-    *p = '\0';
-    strcpy(arg1, buf);
-    strcpy(arg2, p + 1);
-    n1 = atoi(strchr(arg1, '=') + 1);
-    n2 = atoi(strchr(arg2, '=') + 1);
+    *amp = '\0';
+    snprintf(arg1, sizeof(arg1), "%s", query_copy);
+    snprintf(arg2, sizeof(arg2), "%s", amp + 1);
+    n1 = value_from_arg(arg1);
+    n2 = value_from_arg(arg2);
   }
 
-  /* Make the response body */
-  sprintf(content, "QUERY_STRING=%s\r\n<p>", buf);
-  sprintf(content + strlen(content), "Welcome to add.com: ");
-  sprintf(content + strlen(content), "THE Internet addition portal.\r\n<p>");
-  sprintf(content + strlen(content), "The answer is: %d + %d = %d\r\n<p>",
-          n1, n2, n1 + n2);
-  sprintf(content + strlen(content), "Thanks for visiting!\r\n");
+  snprintf(content, sizeof(content),
+           "QUERY_STRING=%s\r\n<p>"
+           "Welcome to add.com: "
+           "THE Internet addition portal.\r\n<p>"
+           "The answer is: %d + %d = %d\r\n<p>"
+           "Thanks for visiting!\r\n",
+           query, n1, n2, n1 + n2);
 
-  /* Generate the HTTP response */
   printf("Content-type: text/html\r\n");
   printf("Content-length: %d\r\n", (int)strlen(content));
   printf("\r\n");
@@ -38,4 +51,3 @@ int main(void)
 
   exit(0);
 }
-/* $end adder */
